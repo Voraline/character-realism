@@ -70,21 +70,7 @@ local function isValidPartToModify(config: Config, part: Instance)
 		local accessory = part:FindFirstAncestorWhichIsA("Accoutrement")
 
 		if accessory then
-			if part.Name ~= "Handle" then
-				local handle = accessory:FindFirstChild("Handle", true)
-
-				if handle and handle:IsA("BasePart") then
-					part = handle
-				end
-			end
-
-			for _, child in part:GetChildren() do
-				if child:IsA("Attachment") then
-					if isHeadAttachment(child) then
-						return true
-					end
-				end
-			end
+			return true
 		elseif part.Name == "Head" then
 			local model = part.Parent
 			local camera = workspace.CurrentCamera
@@ -228,7 +214,7 @@ local function setupSmoothRotation(camera: Camera, config: Config)
 
 				local look = (
 					cameraDirection * (1 - config.MoveDirectionFactor)
-					+ moveDirection * config.MoveDirectionFactor
+						+ moveDirection * config.MoveDirectionFactor
 				).Unit
 
 				local cf = CFrame.new(pos, pos + look)
