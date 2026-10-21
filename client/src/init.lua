@@ -15,9 +15,14 @@ local FirstPersonShadows = require(script.FirstPersonShadows)
 
 local XZ_VECTOR3 = Vector3.new(1, 0, 1)
 
-type Motor =
-	{ Motor: Motor6D, C0: CFrame, Origin: nil }
-	| { Motor: Motor6D, C0: nil, Origin: Attachment }
+type Motor = {
+	Motor: Motor6D?,
+	Constraint: AnimationConstraint?,
+	C0: CFrame?,
+	Origin: Attachment?,
+	Delta: CFrame?,
+	Applied: CFrame?,
+}
 type Rotator = {
 	Motors: { [string]: Motor },
 	Pitch: { Goal: number, Current: number },
@@ -41,6 +46,12 @@ local function roundNearestInterval(number: number, factor)
 	return round(number / factor, 0) * factor
 end
 
+local function isSameCFrame(a: CFrame, b: CFrame)
+	return a.Position:FuzzyEq(b.Position, 1e-4)
+		and a.LookVector:FuzzyEq(b.LookVector, 1e-4)
+		and a.UpVector:FuzzyEq(b.UpVector, 1e-4)
+end
+
 local function stepTowards(value: number, goal, rate): number
 	if math.abs(value - goal) < rate then
 		return goal
@@ -53,9 +64,28 @@ local function stepTowards(value: number, goal, rate): number
 	end
 end
 
--- Register's a newly added Motor6D
+-- Register's a newly added Motor6D or AnimationConstraint
 -- into the provided joint rotator.
-local function addMotor(rotator: Rotator, motor: Motor6D, rigType: Enum.HumanoidRigType)
+local function addMotor(
+	rotator: Rotator,
+	joint: Motor6D | AnimationConstraint,
+	rigType: Enum.HumanoidRigType
+)
+	if joint:IsA("AnimationConstraint") then
+		local attachment0, attachment1 = joint.Attachment0, joint.Attachment1
+		while not (attachment0 and attachment1) do
+			joint.Changed:Wait()
+			attachment0, attachment1 = joint.Attachment0, joint.Attachment1
+		end
+		local part1 = attachment1.Parent
+		if not (part1 and part1:IsA("BasePart")) then
+			return
+		end
+		rotator.Motors[part1.Name] = { Constraint = joint }
+		return
+	end
+
+	local motor = joint
 	local parent = motor.Parent
 	assert(parent and parent:IsA("BasePart"))
 	parent.CanCollide = false -- why
@@ -66,10 +96,16 @@ local function addMotor(rotator: Rotator, motor: Motor6D, rigType: Enum.Humanoid
 		-- Motor becomes active upon parent changing.
 		motor.Changed:Wait()
 	end
+	local part0, part1 = motor.Part0, motor.Part1
+	if not (part0 and part1) then
+		return
+	end
 	local data: Motor
 	if rigType == Enum.HumanoidRigType.R15 then
-		local origin = motor.Part0:WaitForChild(motor.Name .. "RigAttachment", 4)
-		assert(origin, "Couldn't get " .. motor.Name .. "RigAttachment")
+		local origin = part0:WaitForChild(motor.Name .. "RigAttachment", 4)
+		if not (origin and origin:IsA("Attachment")) then
+			return
+		end
 		data = { Motor = motor, Origin = origin }
 	else
 		data = { Motor = motor, C0 = motor.C0 }
@@ -77,7 +113,7 @@ local function addMotor(rotator: Rotator, motor: Motor6D, rigType: Enum.Humanoid
 
 	-- Add this motor to the rotator
 	-- by the name of its Part1 value.
-	rotator.Motors[motor.Part1.Name] = data
+	rotator.Motors[part1.Name] = data
 end
 
 -- Called when the client receives a new look-angle
@@ -201,26 +237,6 @@ local function updateCharacter(delta, config: Config, character, rotator: Rotato
 		end
 		assert(data)
 
-		local motor = data.Motor
-
-		local origin
-		if data.Origin then
-			local part0 = motor.Part0
-			local setPart0 = data.Origin.Parent
-
-			if part0 and part0 ~= setPart0 then
-				local newOrigin = part0:FindFirstChild(data.Origin.Name)
-
-				if newOrigin and newOrigin:IsA("Attachment") then
-					data.Origin = newOrigin
-				end
-			end
-
-			origin = data.Origin.CFrame
-		elseif data.C0 then
-			origin = (CFrame.new(data.C0.Position * character:GetScale()) * data.C0.Rotation)
-		end
-
 		local pitch = pitchState.Current
 		local yaw = yawState.Current
 
@@ -251,8 +267,61 @@ local function updateCharacter(delta, config: Config, character, rotator: Rotato
 			end
 		end
 
-		local rot = origin - origin.Position
 		local cf = CFrame.Angles(0, fYaw, 0) * CFrame.Angles(fPitch, 0, 0)
+
+		local constraint = data.Constraint
+		if constraint then
+			local attachment0 = constraint.Attachment0
+			if not attachment0 then
+				continue
+			end
+
+			local transform = constraint.Transform
+			local previousDelta, previousApplied = data.Delta, data.Applied
+			if
+				previousDelta
+				and previousApplied
+				and isSameCFrame(transform, previousApplied)
+			then
+				transform = previousDelta:Inverse() * transform
+			end
+
+			local rot = attachment0.CFrame.Rotation
+			local offset = rot:Inverse() * cf * rot
+			local applied = offset * transform
+
+			data.Delta = offset
+			data.Applied = applied
+			constraint.Transform = applied
+			continue
+		end
+
+		local motor = data.Motor
+		if not motor then
+			continue
+		end
+
+		local origin
+		if data.Origin then
+			local part0 = motor.Part0
+			local setPart0 = data.Origin.Parent
+
+			if part0 and part0 ~= setPart0 then
+				local newOrigin = part0:FindFirstChild(data.Origin.Name)
+
+				if newOrigin and newOrigin:IsA("Attachment") then
+					data.Origin = newOrigin
+				end
+			end
+
+			origin = data.Origin.CFrame
+		elseif data.C0 then
+			origin = (CFrame.new(data.C0.Position * character:GetScale()) * data.C0.Rotation)
+		else
+			continue
+		end
+
+		local rot = origin - origin.Position
 		motor.C0 = origin * rot:Inverse() * cf * rot
 	end
 end
@@ -291,8 +360,8 @@ local function mountLookAngle(humanoid: Humanoid)
 		-- Record all existing Motor6D joints
 		-- and begin recording newly added ones.
 		local function onDescendantAdded(instance: Instance)
-			if instance:IsA("Motor6D") then
-				addMotor(rotator, instance, humanoid.RigType)
+			if instance:IsA("Motor6D") or instance:IsA("AnimationConstraint") then
+				task.spawn(addMotor, rotator, instance, humanoid.RigType)
 			end
 		end
 		local listener = char.DescendantAdded:Connect(onDescendantAdded)
@@ -443,7 +512,7 @@ function RealismClient.start(config: Config)
 		onHumanoid(humanoid)
 	end
 
-	local conn2 = RunService.Heartbeat:Connect(function(delta)
+	local conn2 = RunService.PreSimulation:Connect(function(delta)
 		updateLookAngles(delta, config)
 	end)
 	config.LookAnglesSyncRemoteEvent.OnClientEvent:Connect(onLookReceive)
